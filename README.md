@@ -24,7 +24,9 @@ github_trending_report # run with defaults
 |------|----------|-------|
 | `curl` | yes | SMTP email sending |
 | `jq` | yes | JSON / fallback reports |
-| `pi` | no | AI-generated reports (v0.79+) |
+| `pi` | no | AI reports (default agent, v0.79+) |
+| `omp` | no | Alternative AI agent (Oh My Pi) |
+| `opencode` | no | Alternative AI agent |
 
 Install on Alpine:
 
@@ -45,6 +47,7 @@ github_trending_report [options]
 | `-r, --range <type>` | Time range: daily / weekly / monthly / yearly | daily |
 | `-d, --days <N>` | Look back N days (overrides --range) | — |
 | `-l, --limit <N>` | Number of repos to fetch | 20 |
+| `--agent <name>` | AI agent: pi / omp / opencode | pi |
 | `--no-email` | Skip sending email | — |
 | `--no-ai` | Skip AI, use jq fallback report | — |
 | `-o, --output <FILE>` | Save report to FILE | — |
@@ -66,6 +69,12 @@ github_trending_report -d 3
 # Past 14 days, 50 repos, jq fallback, quiet
 github_trending_report -d 14 -l 50 --no-ai -q
 
+# Use omp as AI agent
+github_trending_report --agent omp
+
+# Use opencode as AI agent
+github_trending_report --agent opencode
+
 # Monthly, AI only, save to custom path
 github_trending_report -r monthly --no-email -o ./monthly-report.md
 ```
@@ -79,8 +88,11 @@ Priority: **CLI arg > env var > .env file**
 | `TRENDING_RANGE` | daily | daily / weekly / monthly / yearly |
 | `TRENDING_DAYS` | — | Override range with N-day window |
 | `TRENDING_LIMIT` | 20 | Number of repos per report |
+| `AI_AGENT` | pi | AI agent: pi / omp / opencode |
+| `AI_AGENT_TIMEOUT` | 180 | AI agent timeout in seconds |
 | `SMTP_USER` | — | Email account (e.g. `user@qq.com`) |
 | `SMTP_PASS` | — | SMTP password / authorization code |
+| `AI_MODEL_NAME` | auto (pi config) | Override LLM model name in report footer |
 | `MAIL_TO` | — | Recipient email address |
 | `SMTP_SERVER` | smtp.qq.com | SMTP server hostname |
 | `SMTP_PORT` | 465 | SMTP server port |
@@ -109,9 +121,9 @@ Reports are saved to `.reports/` by default:
 └── github-trending-d3-2026-06-21.md
 ```
 
-### AI Reports (with `pi`)
+### AI Reports (configurable agent)
 
-When `pi` is available, generates structured reports with:
+When an AI agent (`pi`, `omp`, or `opencode`) is available, generates structured reports with:
 - Highlights (3-5 featured repos with reasoning)
 - Full ranked table
 - Categorized trend analysis (by domain, language, ecosystem)
@@ -119,7 +131,7 @@ When `pi` is available, generates structured reports with:
 
 ### Fallback Reports (pure jq)
 
-When `pi` is unavailable or `--no-ai` is set, generates a minimal jq-powered report:
+When no AI agent is available, or `--no-ai` is set, generates a minimal jq-powered report:
 - Summary table (rank, repo, stars, language, description)
 - Language distribution
 

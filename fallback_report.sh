@@ -11,6 +11,9 @@ REPO_COUNT=$(jq '.items | length' "$JSON_FILE" 2>/dev/null || echo 0)
 [ "$REPO_COUNT" -eq 0 ] && { echo "# GitHub 趋势报告\n\n⚠ 暂无数据\n"; exit 0; }
 
 TOTAL_STARS=$(jq '[.items[].stargazers_count] | add' "$JSON_FILE" 2>/dev/null || echo 0)
+AVG_STARS=$(jq '[.items[].stargazers_count] | add/length | floor' "$JSON_FILE" 2>/dev/null || echo 0)
+TOTAL_FORKS=$(jq '[.items[].forks_count] | add' "$JSON_FILE" 2>/dev/null || echo 0)
+TOTAL_ISSUES=$(jq '[.items[].open_issues_count] | add' "$JSON_FILE" 2>/dev/null || echo 0)
 DATE_STR=$(date +%Y-%m-%d)
 TIME_STR=$(date +%Y-%m-%d\ %H:%M:%S)
 
@@ -24,6 +27,9 @@ echo "|------|------|"
 echo "| 统计范围 | ${SINCE_DISPLAY} |"
 echo "| 热门仓库数 | ${REPO_COUNT} |"
 echo "| 累计 Star | ${TOTAL_STARS} |"
+echo "| 平均 Star | ${AVG_STARS} |"
+echo "| 总 Fork 数 | ${TOTAL_FORKS} |"
+echo "| 总 Issue 数 | ${TOTAL_ISSUES} |"
 echo "| 生成时间 | ${TIME_STR} CST |"
 echo ""
 echo "---"
@@ -54,7 +60,4 @@ jq -r '[.items[].language // "N/A"] | group_by(.) | map({lang: .[0], count: leng
   echo "- ${lang}: ${count} 个"
 done
 
-echo ""
-echo "---"
-echo "*报告生成时间：${TIME_STR} | 数据来源：GitHub Search API*"
 echo ""

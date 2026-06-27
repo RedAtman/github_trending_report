@@ -6,8 +6,7 @@ set -eu
 # POSIX sh compatible (Alpine, BusyBox, etc.)
 #
 # Dependencies: curl, jq
-# Optional: pi (AI report generation)
-# ============================================================
+# Optional: pi / omp / opencode (AI report generation)
 
 # ── Resolve script directory (follow symlinks, POSIX-compatible) ──
 SCRIPT="$0"
@@ -35,14 +34,13 @@ if [ "${1:-}" = "install" ]; then
 fi
 
 # ── Defaults ──
-RANGE="daily"
-DAYS=""
-LIMIT="${TRENDING_LIMIT:-20}"
 NO_EMAIL=false
 NO_AI=false
+CLI_AGENT_SET=false
+AI_AGENT="${AI_AGENT:-pi}"
+AI_TIMEOUT="${AI_AGENT_TIMEOUT:-180}"
 OUTPUT=""
 QUIET=false
-
 # ── Parse CLI args ──
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -60,6 +58,8 @@ while [ $# -gt 0 ]; do
       NO_EMAIL=true; shift ;;
     --no-ai)
       NO_AI=true; shift ;;
+    --agent)
+      AI_AGENT="$2"; CLI_AGENT_VALUE="$2"; CLI_AGENT_SET=true; shift 2 ;;
     -o|--output)
       OUTPUT="$2"; shift 2 ;;
     -q|--quiet)
@@ -69,9 +69,10 @@ while [ $# -gt 0 ]; do
 Usage: github_trending_report [options]
 
 Options:
-  -r, --range <type>    daily|weekly|monthly|yearly  (default: daily)
+  -r, --range <type>    daily|weekly|monthly|yearly          (default: daily)
   -d, --days <N>        Look back N days (overrides --range)
-  -l, --limit <N>       Number of repos to fetch     (default: 20)
+  -l, --limit <N>       Number of repos to fetch             (default: 20)
+  --agent <name>        AI agent: pi|omp|opencode            (default: pi)
   --no-email            Skip sending email
   --no-ai               Skip AI, use jq fallback report
   -o, --output <FILE>   Save report to FILE
@@ -80,14 +81,17 @@ Options:
   --help                Show this help
 
 Env (priority: CLI > env var > .env):
-  TRENDING_RANGE, TRENDING_DAYS, TRENDING_LIMIT, SMTP_USER, SMTP_PASS
-  MAIL_TO, SMTP_SERVER, SMTP_PORT, REPORT_DIR
+  TRENDING_RANGE, TRENDING_DAYS, TRENDING_LIMIT
+  AI_AGENT, AI_AGENT_TIMEOUT, AI_MODEL_NAME
+  SMTP_USER, SMTP_PASS, MAIL_TO, SMTP_SERVER, SMTP_PORT, REPORT_DIR
 
 Examples:
   github_trending_report
   github_trending_report -d 3
   github_trending_report -d 14 -l 30
   github_trending_report -r weekly -l 30
+  github_trending_report --agent omp
+  github_trending_report --agent opencode
   github_trending_report -r monthly --no-email
   github_trending_report -r yearly --no-ai -o ./report.md
 HELPEOF
@@ -96,6 +100,7 @@ HELPEOF
       echo "Unknown: $1 (use --help)" >&2; exit 1 ;;
   esac
 done
+# Track if --agent was used via CLI (preserve priority over .env)
 
 # ── Load .env (CLI > env > .env) ──
 if [ -f "$SCRIPT_DIR/.env" ]; then
@@ -109,10 +114,21 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
   done < "$SCRIPT_DIR/.env"
 fi
 
+# CLI overrides .env
+[ "$CLI_AGENT_SET" = true ] && AI_AGENT="$CLI_AGENT_VALUE"
+
 # CLI/environment override
 RANGE="${RANGE:-${TRENDING_RANGE:-daily}}"
 LIMIT="${LIMIT:-20}"
 DAYS="${DAYS:-${TRENDING_DAYS:-}}"
+AI_AGENT="${AI_AGENT:-pi}"
+
+# Validate AI_AGENT_TIMEOUT is a positive integer
+case "$AI_TIMEOUT" in
+  ''|*[!0-9]*)
+    echo "Error: AI_AGENT_TIMEOUT requires a positive integer, got '$AI_TIMEOUT'" >&2
+    exit 1 ;;
+esac
 
 LOG="/tmp/trending-run.log"
 log() { [ "$QUIET" = false ] && echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG"; }
@@ -164,6 +180,11 @@ RAW_JSON_FILE="/tmp/trending-raw-data.json"
 echo "$RAW_DATA" > "$RAW_JSON_FILE"
 
 REPO_COUNT=$(echo "$RAW_DATA" | jq '.items | length' 2>/dev/null || echo 0)
+TOTAL_STARS=$(echo "$RAW_DATA" | jq '[.items[].stargazers_count] | add' 2>/dev/null || echo 0)
+AVG_STARS=$(echo "$RAW_DATA" | jq '[.items[].stargazers_count] | add/length | floor' 2>/dev/null || echo 0)
+TOP_LANGS=$(echo "$RAW_DATA" | jq -r '[.items[].language // "N/A"] | group_by(.) | map({lang: .[0], count: length}) | sort_by(-.count) | .[0:3] | map("\(.lang)(\(.count))") | join(", ")' 2>/dev/null || echo "N/A")
+TOTAL_FORKS=$(echo "$RAW_DATA" | jq '[.items[].forks_count] | add' 2>/dev/null || echo 0)
+TOTAL_ISSUES=$(echo "$RAW_DATA" | jq '[.items[].open_issues_count] | add' 2>/dev/null || echo 0)
 log "  ✓ 获取到 ${REPO_COUNT} 个仓库"
 
 if [ "$REPO_COUNT" -eq 0 ]; then
@@ -174,8 +195,7 @@ fi
 # ── Step 2: Report ──
 log "[2/4] 生成报告..."
 
-if [ "$NO_AI" = false ] && command -v pi >/dev/null 2>&1; then
-  log "  → 尝试 AI 生成..."
+if [ "$NO_AI" = false ]; then
   AI_PROMPT="/tmp/trending-ai-prompt.md"
   AI_OUTPUT="/tmp/trending-ai-report.md"
   REPOS_JSON=$(echo "$RAW_DATA" | jq '[.items[] | {name: .full_name, stars: .stargazers_count, lang: .language, desc: .description, url: .html_url, forks: .forks_count, issues: .open_issues_count}]' 2>/dev/null)
@@ -188,7 +208,11 @@ if [ "$NO_AI" = false ] && command -v pi >/dev/null 2>&1; then
 用 Markdown 编写，包含以下结构：
 
 1. **标题**: GitHub 趋势${TITLE} - $(date +%Y-%m-%d)
-2. **概览段落**: 用 2-3 句自然语言概括${LABEL_CN}的热度特征（总项目数 ${REPO_COUNT}，统计范围 ${SINCE_DISPLAY}）
+2. **概览段落**: 用 3-5 句自然语言写一段全面的趋势概览，涵盖以下数据（作为参考，不要逐条罗列）：
+   - 总项目数 ${REPO_COUNT}，统计范围 ${SINCE_DISPLAY}，累计 Star ${TOTAL_STARS}，平均 Star ${AVG_STARS}
+   - 热门语言 TOP3: ${TOP_LANGS}
+   - 最热门项目: 榜首项目及其特点
+   - 总 Fork 数 ${TOTAL_FORKS}，总 Issue 数 ${TOTAL_ISSUES}
 3. **亮点推荐**: 挑选最有亮点的 3-5 个项目，为每个写一段推荐语
 4. **完整榜单**: 用表格列出所有项目
 5. **分类趋势分析**: 对项目进行归类并分析热度
@@ -205,11 +229,71 @@ if [ "$NO_AI" = false ] && command -v pi >/dev/null 2>&1; then
 ${REPOS_JSON}
 PROMPTEOF
 
-  if timeout 120 pi -p "$(cat "$AI_PROMPT")" --no-extensions 2>/dev/null > "$AI_OUTPUT" && [ -s "$AI_OUTPUT" ]; then
-    cp "$AI_OUTPUT" /tmp/github-trending-report.md
-    log "  ✓ AI 报告已生成"
-    AI_OK=true
-  fi
+  case "$AI_AGENT" in
+    pi)
+      if command -v pi >/dev/null 2>&1; then
+        log "  → 使用 AI agent: pi"
+        _AI_EXIT=0
+        timeout "$AI_TIMEOUT" pi -p "$(cat "$AI_PROMPT")" --no-extensions > "$AI_OUTPUT" 2>> "$LOG" || _AI_EXIT=$?
+        if [ "$_AI_EXIT" -eq 0 ] && [ -s "$AI_OUTPUT" ]; then
+          cp "$AI_OUTPUT" /tmp/github-trending-report.md
+          log "  ✓ AI 报告已生成"
+          AI_OK=true
+        elif [ "$_AI_EXIT" -eq 124 ]; then
+          log "  ⚠ agent 'pi' 超时 (${AI_TIMEOUT}s)，stderr 见日志: $LOG"
+        elif [ "$_AI_EXIT" -ne 0 ]; then
+          log "  ⚠ agent 'pi' 失败 (exit $_AI_EXIT)，stderr 见日志: $LOG"
+        else
+          log "  ⚠ agent 'pi' 输出为空，fallback 到 jq"
+        fi
+      else
+        log "  ⚠ agent 'pi' 未安装，fallback 到 jq"
+      fi
+      ;;
+    omp)
+      if command -v omp >/dev/null 2>&1; then
+        log "  → 使用 AI agent: omp"
+        _AI_EXIT=0
+        timeout "$AI_TIMEOUT" omp -p --print --no-extensions "$(cat "$AI_PROMPT")" > "$AI_OUTPUT" 2>> "$LOG" || _AI_EXIT=$?
+        if [ "$_AI_EXIT" -eq 0 ] && [ -s "$AI_OUTPUT" ]; then
+          cp "$AI_OUTPUT" /tmp/github-trending-report.md
+          log "  ✓ AI 报告已生成"
+          AI_OK=true
+        elif [ "$_AI_EXIT" -eq 124 ]; then
+          log "  ⚠ agent 'omp' 超时 (${AI_TIMEOUT}s)，stderr 见日志: $LOG"
+        elif [ "$_AI_EXIT" -ne 0 ]; then
+          log "  ⚠ agent 'omp' 失败 (exit $_AI_EXIT)，stderr 见日志: $LOG"
+        else
+          log "  ⚠ agent 'omp' 输出为空，fallback 到 jq"
+        fi
+      else
+        log "  ⚠ agent 'omp' 未安装，fallback 到 jq"
+      fi
+      ;;
+    opencode)
+      if command -v opencode >/dev/null 2>&1; then
+        log "  → 使用 AI agent: opencode"
+        _AI_EXIT=0
+        timeout "$AI_TIMEOUT" opencode run --format default "$(cat "$AI_PROMPT")" > "$AI_OUTPUT" 2>> "$LOG" || _AI_EXIT=$?
+        if [ "$_AI_EXIT" -eq 0 ] && [ -s "$AI_OUTPUT" ]; then
+          cp "$AI_OUTPUT" /tmp/github-trending-report.md
+          log "  ✓ AI 报告已生成"
+          AI_OK=true
+        elif [ "$_AI_EXIT" -eq 124 ]; then
+          log "  ⚠ agent 'opencode' 超时 (${AI_TIMEOUT}s)，stderr 见日志: $LOG"
+        elif [ "$_AI_EXIT" -ne 0 ]; then
+          log "  ⚠ agent 'opencode' 失败 (exit $_AI_EXIT)，stderr 见日志: $LOG"
+        else
+          log "  ⚠ agent 'opencode' 输出为空，fallback 到 jq"
+        fi
+      else
+        log "  ⚠ agent 'opencode' 未安装，fallback 到 jq"
+      fi
+      ;;
+    *)
+      log "  ⚠ 未知 agent '$AI_AGENT'，fallback 到 jq"
+      ;;
+  esac
 fi
 
 if [ "${AI_OK:-false}" != true ]; then
@@ -241,6 +325,23 @@ if [ "${AI_OK:-false}" != true ]; then
   fi
   log "  ✓ fallback 报告已生成"
 fi
+
+# ── Append handler identifier footer ──
+HANDLER="jq"
+MODEL=""
+if [ "${AI_OK:-false}" = true ]; then
+  HANDLER="$AI_AGENT"
+  MODEL="${AI_MODEL_NAME:-}"
+  if [ -z "$MODEL" ] && [ "$HANDLER" = "pi" ] && [ -f "$HOME/.pi/agent/settings.json" ]; then
+    MODEL=$(jq -r '.defaultModel // ""' "$HOME/.pi/agent/settings.json" 2>/dev/null || true)
+  fi
+  : "${MODEL:=unknown}"
+fi
+{
+  echo ""
+  echo "---"
+  echo "*报告由 ${HANDLER} 生成${MODEL:+ | 模型: ${MODEL}} | 数据来源: GitHub Search API*"
+} >> /tmp/github-trending-report.md
 
 # ── Step 3: Persist ──
 log "[3/4] 持久化报告..."
