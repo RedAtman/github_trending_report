@@ -1,0 +1,6 @@
+.DS_Store
+.omo/
+.opencode/
+.codegraph
+.reports
+.env

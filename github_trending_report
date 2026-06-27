@@ -1,0 +1,306 @@
+#!/bin/sh
+set -eu
+
+# ============================================================
+# GitHub Trending CLI — fetch → report → persist → send
+# POSIX sh compatible (Alpine, BusyBox, etc.)
+#
+# Dependencies: curl, jq
+# Optional: pi (AI report generation)
+# ============================================================
+
+# ── Resolve script directory (follow symlinks, POSIX-compatible) ──
+SCRIPT="$0"
+while [ -h "$SCRIPT" ]; do
+  LINK="$(readlink "$SCRIPT")"
+  case "$LINK" in
+    /*) SCRIPT="$LINK" ;;
+    *) SCRIPT="$(cd "$(dirname "$SCRIPT")" && pwd)/$LINK" ;;
+  esac
+done
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT")" && pwd)"
+
+# ── install subcommand ──
+if [ "${1:-}" = "install" ]; then
+  TARGET="/usr/local/bin/github_trending_report"
+  if [ -e "$TARGET" ]; then
+    echo "Already exists: $TARGET"
+    echo "To overwrite: sudo rm $TARGET && $0 install"
+  else
+    ln -sf "$SCRIPT_DIR/github_trending_report" "$TARGET"
+    echo "Installed to $TARGET"
+    echo "Now run: github_trending_report"
+  fi
+  exit 0
+fi
+
+# ── Defaults ──
+RANGE="daily"
+DAYS=""
+LIMIT="${TRENDING_LIMIT:-20}"
+NO_EMAIL=false
+NO_AI=false
+OUTPUT=""
+QUIET=false
+
+# ── Parse CLI args ──
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -r|--range)
+      RANGE="$2"; shift 2 ;;
+    -d|--days)
+      DAYS="$2"
+      case "$DAYS" in
+        ''|*[!0-9]*) echo "Error: --days requires a positive integer, got '$DAYS'" >&2; exit 1 ;;
+      esac
+      shift 2 ;;
+    -l|--limit)
+      LIMIT="$2"; shift 2 ;;
+    --no-email)
+      NO_EMAIL=true; shift ;;
+    --no-ai)
+      NO_AI=true; shift ;;
+    -o|--output)
+      OUTPUT="$2"; shift 2 ;;
+    -q|--quiet)
+      QUIET=true; shift ;;
+    --help)
+      cat << HELPEOF
+Usage: github_trending_report [options]
+
+Options:
+  -r, --range <type>    daily|weekly|monthly|yearly  (default: daily)
+  -d, --days <N>        Look back N days (overrides --range)
+  -l, --limit <N>       Number of repos to fetch     (default: 20)
+  --no-email            Skip sending email
+  --no-ai               Skip AI, use jq fallback report
+  -o, --output <FILE>   Save report to FILE
+  -q, --quiet           Suppress progress output
+  install               Install to /usr/local/bin/github_trending_report
+  --help                Show this help
+
+Env (priority: CLI > env var > .env):
+  TRENDING_RANGE, TRENDING_DAYS, TRENDING_LIMIT, SMTP_USER, SMTP_PASS
+  MAIL_TO, SMTP_SERVER, SMTP_PORT, REPORT_DIR
+
+Examples:
+  github_trending_report
+  github_trending_report -d 3
+  github_trending_report -d 14 -l 30
+  github_trending_report -r weekly -l 30
+  github_trending_report -r monthly --no-email
+  github_trending_report -r yearly --no-ai -o ./report.md
+HELPEOF
+      exit 0 ;;
+    *)
+      echo "Unknown: $1 (use --help)" >&2; exit 1 ;;
+  esac
+done
+
+# ── Load .env (CLI > env > .env) ──
+if [ -f "$SCRIPT_DIR/.env" ]; then
+  # Minimal .env parser: export KEY=VALUE lines (no expansion)
+  while IFS='=' read -r key val; do
+    case "$key" in
+      ''|\#*) continue ;;
+      *)      val=$(echo "$val" | sed "s/^['\"]//; s/['\"]$//")
+              export "$key=$val" ;;
+    esac
+  done < "$SCRIPT_DIR/.env"
+fi
+
+# CLI/environment override
+RANGE="${RANGE:-${TRENDING_RANGE:-daily}}"
+LIMIT="${LIMIT:-20}"
+DAYS="${DAYS:-${TRENDING_DAYS:-}}"
+
+LOG="/tmp/trending-run.log"
+log() { [ "$QUIET" = false ] && echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG"; }
+: > "$LOG"
+
+# ── Parse time range (BSD date: macOS; GNU date: Linux) ──
+# --days | --range
+if [ -n "$DAYS" ]; then
+  DURATION="-${DAYS}d"
+  LABEL_CN="最近 ${DAYS} 天"
+  LABEL_EN="D${DAYS}"
+  TITLE="报告（${DAYS}天）"
+  RANGE="${DAYS}d"
+else
+  case "$RANGE" in
+    daily)   DURATION="-24H";  LABEL_CN="最近 24 小时"; LABEL_EN="Daily"; TITLE="日报" ;;
+    weekly)  DURATION="-7d";   LABEL_CN="最近 7 天";   LABEL_EN="Weekly"; TITLE="周报" ;;
+    monthly) DURATION="-30d";  LABEL_CN="最近 30 天";  LABEL_EN="Monthly"; TITLE="月报" ;;
+    yearly)  DURATION="-365d"; LABEL_CN="最近 365 天"; LABEL_EN="Yearly"; TITLE="年报" ;;
+    *)
+      echo "Invalid range: $RANGE (daily/weekly/monthly/yearly)" >&2
+      exit 1 ;;
+  esac
+fi
+
+# Cross-platform date: try macOS -v first, then GNU -d
+if date -v-1d >/dev/null 2>&1; then
+  # macOS
+  SINCE=$(date -u -v"$DURATION" +%Y-%m-%dT%H:%M:%SZ)
+  SINCE_START=$(date -u -v"$DURATION" +%Y-%m-%d)
+else
+  # Linux / GNU
+  DUR_SEC=$(echo "$DURATION" | sed 's/d/days/; s/H/hours/')
+  SINCE=$(date -u -d "$DUR_SEC ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "$DURATION" +%Y-%m-%dT%H:%M:%SZ)
+  SINCE_START=$(date -u -d "$DURATION" +%Y-%m-%d 2>/dev/null || date -u -d "$DUR_SEC ago" +%Y-%m-%d)
+fi
+SINCE_END=$(date -u +%Y-%m-%d)
+SINCE_DISPLAY="${SINCE_START} ~ ${SINCE_END}"
+
+log "===== GitHub 趋势${TITLE} ====="
+
+# ── Step 1: Fetch ──
+log "[1/4] 获取 GitHub 热门仓库 (${TITLE})..."
+API_URL="https://api.github.com/search/repositories?q=created:>=${SINCE}&sort=stars&order=desc&per_page=${LIMIT}"
+RAW_DATA=$(curl -sf "$API_URL") || {
+  echo "[ERROR] GitHub API 请求失败" >&2; exit 1; }
+
+RAW_JSON_FILE="/tmp/trending-raw-data.json"
+echo "$RAW_DATA" > "$RAW_JSON_FILE"
+
+REPO_COUNT=$(echo "$RAW_DATA" | jq '.items | length' 2>/dev/null || echo 0)
+log "  ✓ 获取到 ${REPO_COUNT} 个仓库"
+
+if [ "$REPO_COUNT" -eq 0 ]; then
+  echo "[ERROR] 没有获取到数据" >&2
+  exit 1
+fi
+
+# ── Step 2: Report ──
+log "[2/4] 生成报告..."
+
+if [ "$NO_AI" = false ] && command -v pi >/dev/null 2>&1; then
+  log "  → 尝试 AI 生成..."
+  AI_PROMPT="/tmp/trending-ai-prompt.md"
+  AI_OUTPUT="/tmp/trending-ai-report.md"
+  REPOS_JSON=$(echo "$RAW_DATA" | jq '[.items[] | {name: .full_name, stars: .stargazers_count, lang: .language, desc: .description, url: .html_url, forks: .forks_count, issues: .open_issues_count}]' 2>/dev/null)
+
+  cat > "$AI_PROMPT" << PROMPTEOF
+你是一个技术资讯编辑。请根据以下 GitHub 热门仓库数据，生成一份高质量的中文趋势${TITLE}。
+
+## 格式要求
+
+用 Markdown 编写，包含以下结构：
+
+1. **标题**: GitHub 趋势${TITLE} - $(date +%Y-%m-%d)
+2. **概览段落**: 用 2-3 句自然语言概括${LABEL_CN}的热度特征（总项目数 ${REPO_COUNT}，统计范围 ${SINCE_DISPLAY}）
+3. **亮点推荐**: 挑选最有亮点的 3-5 个项目，为每个写一段推荐语
+4. **完整榜单**: 用表格列出所有项目
+5. **分类趋势分析**: 对项目进行归类并分析热度
+6. **趋势观察**: 分析技术趋势方向
+
+## 输出要求
+
+- 直接输出 Markdown，不要额外解释
+- 语言：简体中文
+- 风格：专业、精炼、有洞察
+
+## 原始数据
+
+${REPOS_JSON}
+PROMPTEOF
+
+  if timeout 120 pi -p "$(cat "$AI_PROMPT")" --no-extensions 2>/dev/null > "$AI_OUTPUT" && [ -s "$AI_OUTPUT" ]; then
+    cp "$AI_OUTPUT" /tmp/github-trending-report.md
+    log "  ✓ AI 报告已生成"
+    AI_OK=true
+  fi
+fi
+
+if [ "${AI_OK:-false}" != true ]; then
+  log "  → 使用 fallback 报告 (jq)"
+
+  FALLBACK_SCRIPT="$SCRIPT_DIR/fallback_report.sh"
+  if [ -f "$FALLBACK_SCRIPT" ]; then
+    sh "$FALLBACK_SCRIPT" \
+      "$RAW_JSON_FILE" "${TITLE}" "${LABEL_CN}" "${SINCE_DISPLAY}" \
+      > /tmp/github-trending-report.md 2>/dev/null
+  fi
+
+  # Double fallback: raw jq table
+  if [ ! -s /tmp/github-trending-report.md ]; then
+    log "  ⚠ fallback 也失败，使用基础表格"
+    TOTAL_STARS=$(echo "$RAW_DATA" | jq '[.items[].stargazers_count] | add' 2>/dev/null || echo 0)
+    {
+      echo "# GitHub 趋势${TITLE} - $(date +%Y-%m-%d)"
+      echo ""
+      echo "| # | 仓库 | ⭐ Stars | 语言 | 描述 |"
+      echo "|---|------|---------|------|------|"
+      i=0
+      echo "$RAW_DATA" | jq -r '.items[] | "\(.full_name)|\(.stargazers_count)|\(.language//"-")|\(.description//"-"|gsub("[|\n]";" "))"' 2>/dev/null | \
+        while IFS='|' read -r name stars lang desc; do
+          i=$((i + 1))
+          printf "| %d | [%s](https://github.com/%s) | %s | %s | %s |\n" "$i" "$name" "$name" "$stars" "$lang" "$desc"
+        done
+    } > /tmp/github-trending-report.md
+  fi
+  log "  ✓ fallback 报告已生成"
+fi
+
+# ── Step 3: Persist ──
+log "[3/4] 持久化报告..."
+if [ -n "$OUTPUT" ]; then
+  REPORT_PATH="$OUTPUT"
+else
+  REPORT_DIR="${REPORT_DIR:-$SCRIPT_DIR/.reports}"
+  mkdir -p "$REPORT_DIR"
+  LABEL_LOWER=$(echo "${LABEL_EN}" | tr '[:upper:]' '[:lower:]')
+  REPORT_PATH="${REPORT_DIR}/github-trending-${LABEL_LOWER}-$(date +%Y-%m-%d).md"
+fi
+
+cp /tmp/github-trending-report.md "$REPORT_PATH"
+log "  ✓ 报告已保存到 $REPORT_PATH"
+
+# ── Step 4: Send ──
+if [ "$NO_EMAIL" = true ]; then
+  log "[4/4] --no-email，跳过发送"
+else
+  log "[4/4] 发送邮件..."
+
+  # Read SMTP config (compatible with old/new naming)
+  smtp_user="${SMTP_USER:-${SENDER_EMAIL:-}}"
+  smtp_pass="${SMTP_PASS:-${SMTP_AUTH_CODE:-}}"
+  mail_to="${MAIL_TO:-${RECEIVER_EMAIL:-}}"
+  smtp_server="${SMTP_SERVER:-smtp.qq.com}"
+  smtp_port="${SMTP_PORT:-465}"
+
+  if [ -z "$smtp_user" ] || [ -z "$smtp_pass" ] || [ -z "$mail_to" ]; then
+    log "  ⚠ SMTP 配置不完整，跳过邮件发送"
+    log "    需要: SMTP_USER / SMTP_PASS / MAIL_TO"
+  else
+    SUBJECT="[${LABEL_EN}] GitHub 趋势${TITLE} $(date +%Y-%m-%d)"
+
+    # Send via curl (no Python needed)
+    {
+      echo "From: $smtp_user"
+      echo "To: $mail_to"
+      echo "Subject: $SUBJECT"
+      echo "Content-Type: text/plain; charset=UTF-8"
+      echo "MIME-Version: 1.0"
+      echo ""
+      cat "$REPORT_PATH"
+    } > /tmp/curl-mail-body.txt
+    # --sasl-ir: QQ邮箱 SMTP 要求 SASL 初始响应（凭证和 AUTH 在同一行）
+    curl --mail-from "$smtp_user" \
+         --mail-rcpt "$mail_to" \
+         --ssl-reqd \
+         --sasl-ir \
+         --url "smtps://${smtp_server}:${smtp_port}" \
+         -u "$smtp_user:$smtp_pass" \
+         -T /tmp/curl-mail-body.txt >> "$LOG" 2>&1
+    _curl_exit=$?
+    rm -f /tmp/curl-mail-body.txt
+    if [ "$_curl_exit" -eq 0 ]; then
+      log "  ✓ 邮件已发送"
+    else
+      log "  ✗ 邮件发送失败 (curl exit $_curl_exit)，详情见日志: $LOG"
+    fi
+  fi
+fi
+
+log "✅ 完成！"
