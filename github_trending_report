@@ -33,7 +33,7 @@ if [ "${1:-}" = "install" ]; then
   exit 0
 fi
 
-# ── Defaults ──
+# ── Defaults (shell env > hardcoded, overridden by CLI) ──
 NO_EMAIL=false
 NO_AI=false
 CLI_AGENT_SET=false
@@ -114,12 +114,11 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
   done < "$SCRIPT_DIR/.env"
 fi
 
-# CLI overrides .env
 [ "$CLI_AGENT_SET" = true ] && AI_AGENT="$CLI_AGENT_VALUE"
 
-# CLI/environment override
+# CLI/env override (.env > shell env > hardcoded default)
 RANGE="${RANGE:-${TRENDING_RANGE:-daily}}"
-LIMIT="${LIMIT:-20}"
+LIMIT="${LIMIT:-${TRENDING_LIMIT:-20}}"
 DAYS="${DAYS:-${TRENDING_DAYS:-}}"
 AI_AGENT="${AI_AGENT:-pi}"
 AI_TIMEOUT="${AI_AGENT_TIMEOUT:-180}"
